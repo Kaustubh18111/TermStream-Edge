@@ -1,117 +1,159 @@
-Audio Platform: V4 Edge Architecture
-System Overview
+# ☁️ Audio Platform — Serverless Multi-Tenant Audio Streaming on AWS
 
-This project is a high-performance, multi-tenant audio streaming platform designed entirely for the terminal. It leverages a custom "Headless CLI" architecture, decoupling a highly optimized Rust presentation layer from a Python-based AWS microservice backend.
+> A full-stack cloud-native audio streaming platform built on AWS, featuring Infrastructure as Code (CDK), serverless compute, event-driven ingestion, and a real-time terminal UI. Designed to demonstrate production-grade cloud architecture patterns including multi-tenancy, least-privilege IAM, and decoupled microservices.
 
-The system relies on Amazon Web Services (AWS) for core infrastructure, utilizing Cognito for identity management, DynamoDB for NoSQL metadata tracking, and S3 for encrypted audio and image storage.
-Architectural Updates & Process Flow (V4 Pivot)
+---
 
-The platform has recently undergone a major architectural refactor to bypass terminal 60FPS DOM limitations and improve the ingestion pipeline.
-1. The Headless CLI Architecture
+## Architecture
 
-To achieve native GPU hardware acceleration for album artwork without sacrificing interactive UI elements, the system is split into two distinct binaries:
+```
+┌─────────────┐     ┌──────────────┐     ┌──────────┐     ┌──────────────┐
+│  Producer    │────▶│ API Gateway  │────▶│  Lambda  │────▶│   S3 Bucket  │
+│  CLI (Python)│     │  (REST API)  │     │ (Presign)│     │ (Multi-Tenant│
+└─────────────┘     └──────────────┘     └──────────┘     │   Storage)   │
+                                                          └──────┬───────┘
+       ┌────────────────┐                                        │
+       │ Cognito User   │◀── Auth (SRP) ──┐                     │ S3 Event
+       │ Pool (IdP)     │                  │                     ▼
+       └────────────────┘            ┌─────┴─────┐       ┌──────────────┐
+                                     │ Listener  │       │  SQS Queue   │
+       ┌────────────────┐            │ TUI (mpv) │       │  (Buffer)    │
+       │   DynamoDB     │◀── Scan ───┤           │       └──────┬───────┘
+       │ (Single-Table) │            └───────────┘              │
+       └────────────────┘                                       ▼
+                                                          ┌──────────────┐
+                                                          │   Lambda     │
+                                                          │ (Processor)  │
+                                                          └──────────────┘
+```
 
-    The Presentation Layer (Rust/Ratatui): A lightweight, memory-safe compiled binary. Its sole responsibility is drawing the split-pane grid, managing the ratatui state, and pushing Kitty Graphics Protocol byte streams directly to the terminal emulator. It contains no cloud logic.
+## Cloud Services & Design Decisions
 
-    The Data Broker (Python): A backend microservice (backend.py) that handles all boto3 AWS SDK interactions. The Rust frontend executes this Python script invisibly, captures its standard output as a strict JSON string, and deserializes it into Rust structs for UI rendering.
+| AWS Service | Role | Design Decision |
+|---|---|---|
+| **S3** | Encrypted object storage for audio + cover art | Multi-tenant key schema (`{TenantID}/{FileKey}`); CORS-enabled for pre-signed PUT uploads |
+| **DynamoDB** | NoSQL metadata store | Single-table design with composite key (`TenantID` PK + `SongID` SK); PAY_PER_REQUEST billing for cost optimization |
+| **Cognito** | Managed identity provider | User pool with email sign-in aliases, auto-verification, and `USER_PASSWORD_AUTH` flow for headless CLI clients |
+| **Lambda** | Serverless compute (2 functions) | API handler generates pre-signed S3 URLs; Processor handles event-driven metadata writes |
+| **API Gateway** | RESTful HTTP ingestion endpoint | `POST /upload` with CORS preflight; Lambda proxy integration |
+| **SQS** | Asynchronous event buffer | Decouples S3 upload events from the DynamoDB write path; filters on `.wav` suffix |
+| **CDK (IaC)** | Infrastructure as Code | Entire stack defined in Python CDK; reproducible `cdk deploy` with least-privilege IAM grants |
 
-2. Streamlined V4 Ingestion Engine
+## Key Cloud Engineering Patterns
 
-The client.py producer portal has been rewritten to eliminate redundant data entry:
+- **Infrastructure as Code** — All resources provisioned via AWS CDK (`audio_platform_stack.py`), enabling version-controlled, repeatable deployments
+- **Least-Privilege IAM** — CDK `grant_*` methods scope Lambda permissions to only the actions they need (e.g., `grant_put` for the API handler, `grant_write_data` for the processor)
+- **Event-Driven Architecture** — S3 → SQS → Lambda pipeline decouples ingestion from processing, providing backpressure and fault tolerance
+- **Single-Table DynamoDB Design** — One table serves both user profiles (`SongID = PROFILE_DATA`) and track metadata (`Schema = V4`) using overloaded sort keys
+- **Multi-Tenant Data Isolation** — `TenantID` partition key maps to Cognito username, logically isolating each artist's data and S3 objects
+- **Pre-Signed URL Pattern** — Clients upload directly to S3 via time-limited pre-signed URLs generated by Lambda, keeping binary payloads off the API Gateway
 
-    Persistent User Profiles: Artist bio and stage names are requested only once during initial Cognito registration. This data is stored as a UserProfile schema in DynamoDB using TenantID as the Partition Key and SongID as the Sort Key.
+## DynamoDB Schema
 
-    Automated ID3 Extraction: The ingestion loop now utilizes tinytag to read embedded ID3 metadata directly from .wav, .mp3, and .flac files. Track names, release titles, and featured artist credits are automatically parsed and staged for DynamoDB upload, requiring only a single keystroke confirmation from the user.
+```
+┌──────────────────────────────────────────────────────────────┐
+│                     AudioMetadataTable                       │
+├────────────────┬───────────────┬─────────────────────────────┤
+│ TenantID (PK)  │ SongID (SK)   │ Attributes                  │
+├────────────────┼───────────────┼─────────────────────────────┤
+│ user@email.com │ PROFILE_DATA  │ Schema, ArtistName, Bio     │
+│ user@email.com │ audio_<uuid>  │ Schema(V4), TrackName,      │
+│                │               │ Artist, ReleaseName,        │
+│                │               │ FileName, CoverKey          │
+└────────────────┴───────────────┴─────────────────────────────┘
+```
 
-Tech Stack
+## Project Structure
 
-    Cloud Infrastructure: AWS S3, AWS DynamoDB, AWS Cognito
+```
+audio-platform/
+├── app.py                          # CDK app entrypoint
+├── audio_platform/
+│   └── audio_platform_stack.py     # CloudFormation stack definition (IaC)
+├── lambda/
+│   ├── api_handler/                # Pre-signed URL generation Lambda
+│   └── processor/                  # SQS → DynamoDB writer Lambda
+├── client.py                       # Producer CLI — auth, metadata extraction, S3 upload
+├── backend.py                      # Data broker — headless catalog/auth JSON API
+├── stream.py                       # Listener TUI — Rich UI, mpv streaming, Kitty graphics
+├── reset.py                        # Dev utility — purge Cognito, S3, and DynamoDB
+├── cdk.json                        # CDK configuration
+├── requirements.txt                # Python runtime dependencies
+└── requirements-dev.txt            # Dev/test dependencies
+```
 
-    Backend / Ingestion: Python 3.x, boto3, tinytag
+## Tech Stack
 
-    Frontend / TUI: Rust, ratatui, tokio, crossterm
+| Layer | Technology |
+|---|---|
+| **IaC / Provisioning** | AWS CDK (Python) |
+| **Auth** | AWS Cognito (User Pools, SRP Auth) |
+| **Storage** | AWS S3 (pre-signed URLs, CORS, event notifications) |
+| **Database** | AWS DynamoDB (single-table, on-demand capacity) |
+| **Compute** | AWS Lambda (Python 3.9 runtime) |
+| **Networking** | AWS API Gateway (REST) |
+| **Messaging** | AWS SQS |
+| **Backend / CLI** | Python 3.10+, Boto3, TinyTag, Mutagen |
+| **Frontend / TUI** | Rich, Pillow, mpv (IPC via Unix socket) |
 
-    Media Handling: mpv (Headless audio streaming), Kitty Graphics Protocol (GPU Image Rendering)
+## System Modules
 
-Prerequisites
+### 1. Producer CLI (`client.py`)
+Artist-facing upload pipeline:
+- Authenticates via Cognito (`USER_PASSWORD_AUTH`)
+- Registers new artists with one-time profile setup (stored as `PROFILE_DATA` in DynamoDB)
+- Scans local directories for `.mp3` / `.wav` / `.flac` files
+- Auto-extracts ID3 metadata using TinyTag (track name, artist, album)
+- Extracts embedded cover art via Mutagen
+- Uploads assets to S3 through API Gateway pre-signed URLs
+- Writes V4 schema records to DynamoDB
 
-To run this project locally, your environment must have the following installed:
+### 2. Data Broker (`backend.py`)
+Headless microservice consumed by the TUI:
+- `catalog` — Scans DynamoDB for all `Schema=V4` records, returns JSON
+- `login` — Authenticates user via Cognito, fetches profile, returns role
+- `stream` — Generates time-limited (3600s) pre-signed S3 URLs for playback
 
-    Python 3.10+
+### 3. Listener TUI (`stream.py`)
+Real-time terminal interface for audio playback:
+- Cognito-authenticated session with role-based views (Creator vs. Listener)
+- Catalog/library/settings tabs with fuzzy search
+- Headless mpv playback via Unix domain socket IPC
+- GPU-accelerated cover art rendering via Kitty Graphics Protocol
+- Mouse tracking (SGR) and keyboard navigation
+- Thread-safe state management with `RLock`
 
-    Rust (Cargo)
+### 4. System Purge (`reset.py`)
+Developer utility for environment teardown:
+- Drains Cognito User Pool via admin overrides
+- Empties S3 bucket objects
+- Purges all DynamoDB records
 
-    AWS CLI (Configured with ap-south-1 region credentials)
+> ⚠️ **Irreversible** — intended for development/testing only.
 
-    mpv media player installed on the system PATH
+## Setup
 
-    A terminal emulator that supports the Kitty Graphics Protocol (e.g., Ghostty, Kitty)
-
-Installation & Setup
-
-    Clone and Configure the Python Environment:
-
-Bash
-
-# Navigate to the Python backend directory
+```bash
+# Clone and install Python dependencies
 cd audio-platform
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
 
-# Create and activate the virtual environment
-python -m venv .venv
-source .venv/bin/activate
+# Deploy cloud infrastructure
+npm install -g aws-cdk
+cdk bootstrap   # first-time only
+cdk deploy
 
-# Install required Python dependencies
-pip install boto3 tinytag
+# Run the producer CLI
+python client.py
 
-    Compile the Rust Frontend:
+# Run the listener TUI
+python stream.py
+```
 
-Bash
-
-# Navigate to the Rust TUI directory
-cd audioterm
-
-# Build the release binary
-cargo build --release
-
-System Modules & Execution
-1. Producer Portal (client.py)
-
-Used by artists to authenticate and upload music to the platform.
-
-    Executes Cognito registration and login flows.
-
-    Scans local directories for audio files.
-
-    Extracts metadata via tinytag and uploads assets to S3.
-
-    Commits V4 schema records to DynamoDB.
-
-    Usage: python client.py
-
-2. The Data Broker (backend.py)
-
-A headless microservice. It is not meant to be interacted with directly by the user. It is called internally by the Rust binary to fetch the global catalog from DynamoDB and return it as a JSON payload.
-
-    Usage: python backend.py catalog
-
-3. Listener Portal (audioterm)
-
-The main interactive terminal user interface. It renders the global catalog, listens for keyboard events, and orchestrates the S3 stream and native GPU artwork rendering.
-
-    Usage: cargo run (Development) or ./target/release/audioterm (Production)
-
-4. System Purge (reset.py)
-
-A developer utility to completely format the cloud environment. It iterates through the Cognito User Pool, drops all registered users via admin overrides, deletes all objects in the S3 bucket, and purges all records in the DynamoDB table.
-
-    Usage: python reset.py
-
-    Warning: This action is irreversible.
-
-Database Schema (DynamoDB)
-
-The AudioMetadataTable utilizes a single-table design pattern.
-
-    Partition Key: TenantID (String) - Maps to the Cognito Username.
-
-    Sort Key: SongID (String) - Maps to either the unique track filename or standard identifiers like PROFILE_DATA.
+### Prerequisites
+- Python 3.10+
+- AWS CLI configured with `ap-south-1` credentials
+- Node.js (for AWS CDK CLI)
+- mpv media player on `$PATH`
+- Kitty-protocol-compatible terminal (Ghostty, Kitty, WezTerm)
