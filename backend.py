@@ -5,7 +5,6 @@ import sys
 # --- CONFIGURATION ---
 REGION = 'ap-south-1'
 BUCKET_NAME = "audioplatformstack-audiostoragebucketd8d3b0dc-qfiv3hvchgq4"
-# IMPORTANT: Copy your Cognito Client ID from client.py and paste it here:
 CLIENT_ID = "1ate091qv7ibstkvo0il3lsbrv" 
 
 dynamodb = boto3.resource('dynamodb', region_name=REGION)
